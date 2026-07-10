@@ -303,28 +303,39 @@ pub fn run_console(target: String) -> Result<()> {
 
         match engine.traceroute().await {
             Ok(()) => {
-                println!("Traceroute complete. Hops discovered:\n");
+                let hops = engine.hops();
 
-                for hop in engine.hops() {
-                    println!(
-                        "Hop {}: {} ({})",
-                        hop.hop_number,
-                        hop.hostname.as_deref().unwrap_or("unknown"),
-                        hop.ip
-                    );
+                // Try to get the resolved target IP from the last hop
+                let target_ip = hops.last()
+                    .map(|h| h.ip.to_string())
+                    .unwrap_or_else(|| engine.target().to_string());
 
-                    // Print statistics for each hop
-                    let (min, avg, max) = hop.rtt_stats();
-                    println!(
-                        "    RTT: min={:?}ms, avg={:?}ms, max={:?}ms, loss={:.1}%",
-                        min,
-                        avg,
-                        max,
-                        hop.loss_percentage()
-                    );
+                // Header — standard traceroute format
+                println!("\ntraceroute to {} ({}), 30 hops max, 40 byte packets",
+                         engine.target(), target_ip);
+
+                for hop in hops {
+                    let rtts = &hop.rtts;
+
+                    // Format each probe RTT or show asterisk on timeout
+                    let rtt1 = rtts.get(0).map(|r| format!("{:.2} ms", r)).unwrap_or("*".to_string());
+                    let rtt2 = rtts.get(1).map(|r| format!("{:.2} ms", r)).unwrap_or("*".to_string());
+                    let rtt3 = rtts.get(2).map(|r| format!("{:.2} ms", r)).unwrap_or("*".to_string());
+
+                    // Hop display: number, IP, and per-probe RTTs
+                    if rtts.is_empty() {
+                        println!("{:>3}  *                    {}        {}        {}",
+                                 hop.hop_number, rtt1, rtt2, rtt3);
+                    } else {
+                        println!("{:>3}  {:<20} {:>8}  {:>8}  {:>8}",
+                                 hop.hop_number, hop.ip, rtt1, rtt2, rtt3);
+                    }
                 }
 
-                println!("\nTotal hops discovered: {}", engine.hop_count());
+                // Summary footer
+                let responded = hops.iter().filter(|h| !h.rtts.is_empty()).count();
+                println!("\n--- traceroute to {} ({}) ---", engine.target(), target_ip);
+                println!(" {} hops probed, {} responded", hops.len(), responded);
             }
             Err(e) => {
                 eprintln!("Traceroute failed: {}", e);
