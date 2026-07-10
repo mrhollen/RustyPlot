@@ -140,7 +140,7 @@ impl NetworkEngine {
         info!("Resolved target to: {}", target_ip);
 
         // Run our custom traceroute
-        let traceroute_hops = traceroute::run_traceroute(target_ip).await?;
+        let (traceroute_hops, target_reached) = traceroute::run_traceroute(target_ip).await?;
 
         // Convert traceroute::HopData -> our Hop struct
         for tr_hop in traceroute_hops {
@@ -156,8 +156,48 @@ impl NetworkEngine {
             self.hops.push(hop);
         }
 
+        // If traceroute didn't reach the target, do a fallback ping
+        if !target_reached {
+            println!("\n📡 Traceroute did not reach target. Checking reachability...");
+            if let Ok(true) = Self::ping_target(&target_ip).await {
+                println!("✅ Target {} is reachable (intermediate hops may be filtering ICMP)", target_ip);
+            } else {
+                println!("❌ Target {} appears unreachable", target_ip);
+            }
+        }
+
         info!("Traceroute complete. Discovered {} hops", self.hops.len());
         Ok(())
+    }
+
+    /// Perform a single ICMP ping to check if a target is reachable
+    async fn ping_target(target_ip: &std::net::IpAddr) -> Result<bool> {
+        use surge_ping::{ICMP, PingIdentifier, PingSequence};
+
+        let ipv4 = match target_ip {
+            std::net::IpAddr::V4(ip) => *ip,
+            std::net::IpAddr::V6(_) => return Ok(false), // IPv6 ping not implemented
+        };
+
+        let config = Config::builder().kind(ICMP::V4).build();
+        let client = Client::new(&config)?;
+
+        let mut pinger = client.pinger(std::net::IpAddr::V4(ipv4), PingIdentifier(0x1234)).await;
+        pinger.timeout(std::time::Duration::from_secs(2));
+
+        // Try up to 3 pings
+        for seq in 0..3u16 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                pinger.ping(PingSequence(seq), b"rustyplot"),
+            ).await {
+                Ok(Ok((_packet, _rtt))) => return Ok(true),
+                Ok(Err(_)) => continue,
+                Err(_) => continue, // timeout
+            }
+        }
+
+        Ok(false)
     }
 
     /// Resolve a hostname to an IP address

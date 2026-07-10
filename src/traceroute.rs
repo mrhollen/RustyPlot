@@ -218,7 +218,8 @@ fn read_error_queue(fd: i32) -> Result<Option<(IpAddr, IcmpResponseType, f64)>> 
 // ─── Main Traceroute Logic ──────────────────────────────────────────────
 
 /// Run a traceroute to the target IP address.
-pub async fn run_traceroute(target: IpAddr) -> Result<Vec<HopData>> {
+/// Returns `(hops, target_reached)` where `target_reached` indicates if the final destination was contacted.
+pub async fn run_traceroute(target: IpAddr) -> Result<(Vec<HopData>, bool)> {
     let target_ip = match target {
         IpAddr::V4(ip) => ip,
         IpAddr::V6(_) => {
@@ -227,6 +228,7 @@ pub async fn run_traceroute(target: IpAddr) -> Result<Vec<HopData>> {
     };
 
     let mut hops: Vec<HopData> = Vec::new();
+    let mut target_reached = false;
 
     println!("🔍 Starting traceroute to {}...", target);
 
@@ -235,7 +237,6 @@ pub async fn run_traceroute(target: IpAddr) -> Result<Vec<HopData>> {
     for ttl in 1..=MAX_HOPS {
         let mut hop_rtts: Vec<f64> = Vec::new();
         let mut responder_ip: Option<IpAddr> = None;
-        let mut target_reached = false;
 
         // Set TTL for this hop
         set_ttl(fd, ttl as i32)?;
@@ -335,7 +336,6 @@ pub async fn run_traceroute(target: IpAddr) -> Result<Vec<HopData>> {
         }
 
         if target_reached {
-            println!("✅ Target reached at hop {}", ttl);
             break;
         }
     }
@@ -343,6 +343,9 @@ pub async fn run_traceroute(target: IpAddr) -> Result<Vec<HopData>> {
     // Close the socket
     unsafe { libc::close(fd) };
 
+    if target_reached {
+        println!("✅ Target reached at hop {}", hops.last().unwrap().hop_number);
+    }
     println!("Total hops discovered: {}", hops.len());
-    Ok(hops)
+    Ok((hops, target_reached))
 }
