@@ -1,10 +1,10 @@
 # RustyPlot
 
-A lightweight, graphical traceroute and ping utility that reports real-time latency and packet loss. Built with Rust, using TCP-based probes that work without sudo/root privileges.
+A lightweight, graphical traceroute and ping utility that reports real-time latency and packet loss. Built with Rust, using UDP-based probes that work without sudo/root privileges.
 
 ## Features
 
-- 🚀 **No Sudo Required** - Uses TCP-based traceroute (no raw socket permissions needed)
+- 🚀 **No Sudo Required** - Uses UDP-based traceroute (no raw socket permissions needed)
 - 📊 **Real-time Monitoring** - Continuous ping every 1 second with live updates
 - 📈 **Timeline Graphs** - Visual RTT history using egui_plot
 - 📉 **Packet Loss Tracking** - Rolling buffer of last 100 measurements per hop
@@ -26,7 +26,7 @@ The binary will be at `target/release/rustyplot`.
 ### Requirements
 
 - Rust 1.70 or later
-- On Linux/macOS: No special permissions required (TCP mode)
+- On Linux/macOS: No special permissions required (UDP mode)
 - On Windows: Works out of the box
 
 ## Usage
@@ -77,7 +77,7 @@ Click on any hop in the table to:
 
 ## How It Works
 
-1. **Traceroute Phase**: Discovers network path using TCP SYN probes with increasing TTL
+1. **Traceroute Phase**: Discovers network path using UDP probes with IP_RECVERR for capturing ICMP errors
 2. **Continuous Ping Phase**: Spawns concurrent tasks to ping each hop every second
 3. **Data Collection**: Maintains rolling buffer of last 100 RTT samples per hop
 4. **Metrics Calculation**: Computes packet loss, average RTT, min/max, and jitter
@@ -85,8 +85,7 @@ Click on any hop in the table to:
 ## Technical Details
 
 ### Protocol
-- Uses TCP SYN packets to port 80 for traceroute
-- Falls back gracefully to ICMP if available
+- Uses UDP packets with IP_RECVERR to capture ICMP Time Exceeded and Port Unreachable messages
 - No raw socket permissions required
 
 ### Concurrency

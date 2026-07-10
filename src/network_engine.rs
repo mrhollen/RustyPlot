@@ -22,6 +22,7 @@ use surge_ping::{Client, Config, PingIdentifier, PingSequence, ICMP};
 pub struct Hop {
     pub hop_number: u8,
     pub ip: IpAddr,
+    #[allow(dead_code)]
     pub hostname: Option<String>,
     /// Rolling buffer of last 100 RTT measurements (in milliseconds)
     pub rtts: Vec<f64>,
@@ -58,6 +59,7 @@ impl Hop {
     }
 
     /// Calculate packet loss percentage
+    #[allow(dead_code)]
     pub fn loss_percentage(&self) -> f64 {
         if self.packets_sent == 0 {
             return 0.0;
@@ -79,6 +81,7 @@ impl Hop {
     }
 
     /// Get min/avg/max RTT statistics
+    #[allow(dead_code)]
     pub fn rtt_stats(&self) -> (Option<f64>, Option<f64>, Option<f64>) {
         if self.rtts.is_empty() {
             return (None, None, None);
@@ -90,6 +93,7 @@ impl Hop {
     }
 
     /// Add a new RTT measurement, maintaining rolling buffer of 100
+    #[allow(dead_code)]
     pub fn add_rtt(&mut self, rtt_ms: f64) {
         if self.rtts.len() >= 100 {
             self.rtts.remove(0);
@@ -208,15 +212,11 @@ impl NetworkEngine {
         }
 
         // Try to resolve as hostname
-        match tokio::net::lookup_host(format!("{}:80", target)).await {
-            addrs => {
-                let mut addrs = addrs?;
-                if let Some(addr) = addrs.next() {
-                    Ok(addr.ip())
-                } else {
-                    Err(anyhow!("No IP address found for target: {}", target))
-                }
-            }
+        let mut addrs = tokio::net::lookup_host(format!("{}:80", target)).await?;
+        if let Some(addr) = addrs.next() {
+            Ok(addr.ip())
+        } else {
+            Err(anyhow!("No IP address found for target: {}", target))
         }
     }
 

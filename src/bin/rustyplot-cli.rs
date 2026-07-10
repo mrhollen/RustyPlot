@@ -104,7 +104,7 @@ async fn run_traceroute(engine: &mut NetworkEngine) -> Result<()> {
         }
     };
 
-    print_target_info(&target_ip, &target_ip_str);
+   print_target_info(&target_ip, &target_ip_str);
     print_table_header();
 
     let hops = engine.hops();
@@ -176,7 +176,7 @@ async fn run_continuous_ping(engine: &mut NetworkEngine, stop_flag: Arc<AtomicBo
         }
 
         // Re-print header
-   print_target_info(&target_ip, &target_ip_str);
+   print_target_info(target_ip, &target_ip_str);
         print_table_header();
 
         // Ping each hop

@@ -25,7 +25,7 @@ use ui_renderer::{SortColumn, SortDirection};
 /// Application state for the GUI
 struct RustyPlotApp {
     target: String,
-    state: Arc<tokio::sync::Mutex<AppState>>,
+    state: Arc<std::sync::Mutex<AppState>>,
     stop_signal: Arc<AtomicBool>,
     selected_hop: Option<usize>,
     /// Sorting state for the hop table
@@ -41,7 +41,7 @@ impl RustyPlotApp {
         // Set up dark theme
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
-        let state = Arc::new(tokio::sync::Mutex::new(AppState::new(target.clone())));
+        let state = Arc::new(std::sync::Mutex::new(AppState::new(target.clone())));
 
         Self {
             target,
@@ -82,7 +82,7 @@ impl RustyPlotApp {
                     // Initialize app state with discovered hops
                     let hop_numbers: Vec<u8> = engine.hops().iter().map(|h| h.hop_number).collect();
                     {
-                        let mut state = state_clone.lock().await;
+                        let mut state = state_clone.lock().unwrap();
                         state.initialize_hops(hop_numbers);
                         state.set_hop_ips(engine.hops());
                         state.set_traceroute_complete(true);
@@ -91,8 +91,6 @@ impl RustyPlotApp {
                     // Start continuous ping if not stopped
                     if !stop_clone.load(Ordering::SeqCst) {
                         let state_for_ping = Arc::clone(&state_clone);
-                        // Convert tokio::sync::Mutex to std::sync::Mutex for the engine
-                        // We'll use a different approach - directly update state in the ping task
                         if let Err(e) = start_ping_task(engine, state_for_ping, stop_clone, target) {
                             error!("Failed to start ping task: {}", e);
                         }
@@ -100,7 +98,7 @@ impl RustyPlotApp {
                 }
                 Err(e) => {
                     error!("Traceroute failed: {}", e);
-                    let mut state = state_clone.lock().await;
+                    let mut state = state_clone.lock().unwrap();
                     state.set_traceroute_complete(false);
                 }
             }
@@ -114,25 +112,10 @@ impl RustyPlotApp {
 /// Start the continuous ping task
 fn start_ping_task(
     engine: NetworkEngine,
-    state: Arc<tokio::sync::Mutex<AppState>>,
+    state: Arc<std::sync::Mutex<AppState>>,
     _stop_signal: Arc<AtomicBool>,
     _target: String,
 ) -> Result<()> {
-    use std::sync::Mutex as StdMutex;
-
-    // Create a std::sync::Mutex wrapper for the ping task
-    // The network_engine expects std::sync::Mutex, so we wrap our tokio::sync::Mutex
-    let _std_state: Arc<StdMutex<AppState>> = Arc::new(StdMutex::new({
-        // Create a fresh AppState that will be updated by the ping task
-        // and then synced back to the tokio mutex
-        AppState::new(String::new())
-    }));
-
-    // Actually, let's use a different approach: clone the tokio state and convert
-    // We'll create a hybrid approach where we use the tokio mutex directly
-    // by implementing our own ping loop that doesn't rely on network_engine's start_continuous_ping
-
-    // For now, let's just spawn the ping task directly without using network_engine's method
     let state_clone = Arc::clone(&state);
     let hops = engine.hops().clone();
     let target_name = engine.target().to_string();
@@ -149,7 +132,7 @@ fn start_ping_task(
     // Set ping running flag
     let state_clone2 = Arc::clone(&state_clone);
     tokio::spawn(async move {
-        let mut state = state_clone2.lock().await;
+        let mut state = state_clone2.lock().unwrap();
         state.set_ping_running(true);
     });
 
@@ -185,7 +168,7 @@ fn start_ping_task(
                                 let rtt_ms = rtt.as_secs_f64() * 1000.0;
 
                                 // Update the shared state
-                                let mut state_guard = state_clone.lock().await;
+                                let mut state_guard = state_clone.lock().unwrap();
                                 state_guard.add_ping_result(hop.hop_number, rtt_ms, true);
                                 drop(state_guard);
 
@@ -195,14 +178,14 @@ fn start_ping_task(
                                 warn!("Ping to hop {} failed: {}", hop.hop_number, e);
 
                                 // Update the shared state with failure
-                                let mut state_guard = state_clone.lock().await;
+                                let mut state_guard = state_clone.lock().unwrap();
                                 state_guard.add_ping_result(hop.hop_number, 0.0, false);
                             }
                         }
                     }
                     Err(e) => {
                         warn!("Failed to create client for hop {}: {}", hop.hop_number, e);
-                        let mut state_guard = state_clone.lock().await;
+                        let mut state_guard = state_clone.lock().unwrap();
                         state_guard.add_ping_result(hop.hop_number, 0.0, false);
                     }
                 }
@@ -227,17 +210,9 @@ impl eframe::App for RustyPlotApp {
 
         // Check stop signal
         if self.stop_signal.load(Ordering::SeqCst) {
-            // Set ping running to false - must use separate thread with tokio runtime
-            // because eframe doesn't provide a tokio runtime by default
-            let state_clone = Arc::clone(&self.state);
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new()
-                    .expect("Failed to create tokio runtime");
-                rt.block_on(async move {
-                    let mut state = state_clone.lock().await;
-                    state.set_ping_running(false);
-                });
-            });
+            self.stop_signal.store(false, Ordering::SeqCst);
+            let mut state = self.state.lock().unwrap();
+            state.set_ping_running(false);
         }
 
         // Render the main UI
@@ -318,7 +293,7 @@ pub fn run_console(target: String) -> Result<()> {
                     let rtts = &hop.rtts;
 
                     // Format each probe RTT or show asterisk on timeout
-                    let rtt1 = rtts.get(0).map(|r| format!("{:.2} ms", r)).unwrap_or("*".to_string());
+                    let rtt1 = rtts.first().map(|r| format!("{:.2} ms", r)).unwrap_or("*".to_string());
                     let rtt2 = rtts.get(1).map(|r| format!("{:.2} ms", r)).unwrap_or("*".to_string());
                     let rtt3 = rtts.get(2).map(|r| format!("{:.2} ms", r)).unwrap_or("*".to_string());
 
@@ -423,7 +398,7 @@ mod tests {
         // that the structure compiles correctly
         let app = RustyPlotApp {
             target: "test.com".to_string(),
-            state: Arc::new(tokio::sync::Mutex::new(AppState::new("test.com".to_string()))),
+            state: Arc::new(std::sync::Mutex::new(AppState::new("test.com".to_string()))),
             stop_signal: Arc::new(AtomicBool::new(false)),
             selected_hop: None,
             sort_column: SortColumn::default(),

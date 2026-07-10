@@ -1,6 +1,6 @@
-//! RustyPlot - A TCP-based graphical traceroute tool
+//! RustyPlot - A UDP-based graphical traceroute tool
 //!
-//! This crate provides a network diagnostic tool that uses TCP-based
+//! This crate provides a network diagnostic tool that uses UDP-based
 //! traceroute and continuous ping to monitor network path quality.
 
 pub mod app_state;

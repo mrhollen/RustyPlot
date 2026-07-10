@@ -26,13 +26,19 @@ pub struct HopState {
     pub is_alive: bool,
 }
 
-impl HopState {
-    pub fn new() -> Self {
+impl Default for HopState {
+    fn default() -> Self {
         Self {
             results: Vec::with_capacity(MAX_HISTORY_SIZE),
             latest_rtt: None,
             is_alive: false,
         }
+    }
+}
+
+impl HopState {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn add_result(&mut self, rtt_ms: f64, success: bool) {
@@ -159,7 +165,7 @@ impl AppState {
     pub fn add_ping_result(&mut self, hop_number: u8, rtt_ms: f64, success: bool) {
         self.hops
             .entry(hop_number)
-            .or_insert_with(HopState::new)
+            .or_default()
             .add_result(rtt_ms, success);
     }
 

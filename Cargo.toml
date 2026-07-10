@@ -2,7 +2,7 @@
 name = "rustyplot"
 version = "0.1.0"
 edition = "2021"
-description = "A TCP-based graphical traceroute tool for diagnosing network connections"
+description = "A UDP-based graphical traceroute tool for diagnosing network connections"
 
 [dependencies]
 # Core error handling

@@ -41,7 +41,7 @@ fn hop_color(hop_num: u8) -> egui::Color32 {
 /// Render the main UI for RustyPlot
 pub fn render(
     ctx: &egui::Context,
-    state: &Arc<tokio::sync::Mutex<AppState>>,
+    state: &Arc<std::sync::Mutex<AppState>>,
     selected_hop: &mut Option<usize>,
     stop_signal: &Arc<AtomicBool>,
     sort_column: &mut SortColumn,

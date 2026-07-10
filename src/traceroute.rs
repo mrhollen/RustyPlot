@@ -132,7 +132,7 @@ fn send_probe(fd: i32, target: Ipv4Addr, port: u16, payload: &[u8]) -> Result<()
 /// Returns (responder_ip, response_type, rtt_ms) or None if no error available.
 fn read_error_queue(fd: i32) -> Result<Option<(IpAddr, IcmpResponseType, f64)>> {
     let mut iov = iovec {
-        iov_base: std::ptr::null_mut() as *mut c_void,
+        iov_base: std::ptr::null_mut(),
         iov_len: 0,
     };
 
@@ -245,7 +245,7 @@ pub async fn run_traceroute(target: IpAddr) -> Result<(Vec<HopData>, bool)> {
         let port = BASE_PORT + ttl as u16;
 
         // Create a simple payload
-        let payload = [ttl as u8; PROBE_SIZE];
+        let payload = [ttl; PROBE_SIZE];
 
         // Send probes and read responses
         for attempt in 1..=ATTEMPTS_PER_HOP {
