@@ -15,6 +15,7 @@ use log::{debug, info, error, warn};
 
 mod app_state;
 mod network_engine;
+mod traceroute;
 mod ui_renderer;
 
 use app_state::AppState;

@@ -1,8 +1,7 @@
-//! TCP-based traceroute and continuous ping engine using surge-ping crate.
-//! No sudo required - uses ICMP packets with configurable TTL for traceroute.
+//! Network engine: custom raw-socket ICMP traceroute + continuous ping via surge-ping.
 //!
-//! Note: On Linux, ICMP sockets work without sudo due to kernel capabilities.
-//! For true TCP-based traceroute, you would need raw socket capabilities.
+//! - Traceroute: custom raw-socket ICMP with increasing TTL (see `crate::traceroute`)
+//! - Continuous ping: surge-ping crate (no raw sockets needed)
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -15,6 +14,7 @@ use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 use crate::app_state::AppState;
+use crate::traceroute;
 use surge_ping::{Client, Config, PingIdentifier, PingSequence, ICMP};
 
 /// Represents a single hop in the traceroute
@@ -127,9 +127,8 @@ impl NetworkEngine {
 
     /// Perform traceroute to discover hops to the target
     ///
-    /// Uses ICMP packets with increasing TTL values.
-    /// Maximum 30 hops, 2 attempts per hop, 500ms timeout per attempt.
-    /// Optimized for responsiveness: early exit after first failed attempt.
+    /// Uses custom raw-socket ICMP traceroute with increasing TTL values.
+    /// Maximum 30 hops, 3 attempts per hop, 2s timeout per attempt.
     pub async fn traceroute(&mut self) -> Result<()> {
         info!("Starting traceroute to {}", self.target);
 
@@ -140,17 +139,21 @@ impl NetworkEngine {
         let target_ip = self.resolve_target(&self.target).await?;
         info!("Resolved target to: {}", target_ip);
 
-        // Perform traceroute with increasing TTL
-        self.traceroute_icmp(target_ip).await?;
+        // Run our custom traceroute
+        let traceroute_hops = traceroute::run_traceroute(target_ip).await?;
 
-        // If we discovered hops, add the final target as the last hop if not already present
-        if !self.hops.is_empty() {
-            let last_hop_ip = self.hops.last().unwrap().ip;
-            if last_hop_ip != target_ip {
-                // Target was reached, add it as final hop
-                let hop_number = (self.hops.len() + 1) as u8;
-                self.hops.push(Hop::new(hop_number, target_ip));
+        // Convert traceroute::HopData -> our Hop struct
+        for tr_hop in traceroute_hops {
+            // Skip timeout hops (0.0.0.0) — they don't add value
+            if tr_hop.ip == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) {
+                continue;
             }
+
+            let mut hop = Hop::new(tr_hop.hop_number, tr_hop.ip);
+            hop.rtts = tr_hop.rtts;
+            hop.packets_sent = tr_hop.packets_sent;
+            hop.packets_received = tr_hop.packets_received;
+            self.hops.push(hop);
         }
 
         info!("Traceroute complete. Discovered {} hops", self.hops.len());
@@ -174,137 +177,6 @@ impl NetworkEngine {
                     Err(anyhow!("No IP address found for target: {}", target))
                 }
             }
-        }
-    }
-
-    /// Perform ICMP-based traceroute using increasing TTL
-    ///
-    /// Optimized for responsiveness:
-    /// - 500ms timeout per attempt (instead of 2s)
-    /// - 2 attempts per hop (instead of 3)
-    /// - Early exit: if first attempt fails, immediately try next hop
-    /// - Only do second attempt if first succeeds but we haven't reached target
-    async fn traceroute_icmp(&mut self, target: IpAddr) -> Result<()> {
-        const MAX_HOPS: u8 = 30;
-        const ATTEMPTS_PER_HOP: u32 = 3;
-        const TIMEOUT: Duration = Duration::from_secs(2);
-        const PAYLOAD: &[u8] = b"traceroute";
-
-        // Determine ICMP type based on target address
-        let icmp_type = if target.is_ipv4() { ICMP::V4 } else { ICMP::V6 };
-
-        // Progress indicator
-        println!("\n🔍 Starting traceroute to {}...", self.target);
-        println!("Press Ctrl+C to stop\n");
-
-        for hop_num in 1..=MAX_HOPS {
-            // Progress indicator every 5 hops
-            if hop_num == 1 || hop_num % 5 == 0 {
-                println!("📍 Probing hop {}...", hop_num);
-            }
-
-            debug!("Probing hop {}", hop_num);
-
-            let mut hop_resolved = false;
-            let mut first_attempt_failed = false;
-
-            for attempt in 1..=ATTEMPTS_PER_HOP {
-                debug!("  Attempt {}/{} for hop {}", attempt, ATTEMPTS_PER_HOP, hop_num);
-
-                match self.probe_hop_with_ttl(hop_num, target, icmp_type, TIMEOUT, PAYLOAD).await {
-                    Ok((ip, rtt_ms)) => {
-                        // We got a response
-                        if !hop_resolved {
-                            // First time seeing this hop, create entry
-                            let mut hop = Hop::new(hop_num, ip);
-                            hop.add_rtt(rtt_ms);
-                            hop.packets_sent = 1;
-                            hop.packets_received = 1;
-                            self.hops.push(hop);
-                            hop_resolved = true;
-                            // Print immediately for responsiveness
-                            println!("Hop {}: {} ({}ms)", hop_num, ip, rtt_ms.round() as u64);
-                        } else {
-                            // Update existing hop
-                            if let Some(hop) = self.hops.last_mut() {
-                                hop.add_rtt(rtt_ms);
-                                hop.packets_sent += 1;
-                                hop.packets_received += 1;
-                            }
-                        }
-
-                        // If we reached the target, we're done
-                        if ip == target {
-                            println!("✅ Target reached at hop {}", hop_num);
-                            info!("Target reached at hop {}", hop_num);
-                            return Ok(());
-                        }
-
-                        // Collect all RTT measurements across all attempts
-                    }
-                    Err(e) => {
-                        debug!("  Attempt {} failed: {}", attempt, e);
-                        if attempt == 1 {
-                            first_attempt_failed = true;
-                            // Continue to second attempt only
-                        }
-                    }
-                }
-            }
-
-            // If we didn't get any response after all attempts
-            if !hop_resolved {
-                // Print unresponsive hop for visibility
-                if first_attempt_failed {
-                    println!("Hop {}: * (timeout)", hop_num);
-                }
-                warn!("Hop {} did not respond after {} attempts", hop_num, ATTEMPTS_PER_HOP);
-
-                // Continue to next hop - some routers don't respond (blackhole)
-                // but the target might still be reachable
-                continue;
-            }
-        }
-
-        println!("\n⚠️  Reached maximum hop count ({}). Target may be unreachable.", MAX_HOPS);
-        warn!("Reached maximum hop count ({}). Target may be unreachable.", MAX_HOPS);
-        Ok(())
-    }
-
-    /// Probe a single hop using ICMP with specified TTL
-    ///
-    /// Returns the responding IP and RTT in milliseconds
-    async fn probe_hop_with_ttl(
-        &self,
-        hop_num: u8,
-        target: IpAddr,
-        icmp_type: ICMP,
-        timeout: Duration,
-        payload: &[u8],
-    ) -> Result<(IpAddr, f64)> {
-        // Create config with the TTL for this hop
-        let config = Config::builder()
-            .kind(icmp_type)
-            .ttl(hop_num as u32)
-            .build();
-
-        // Create client and pinger
-        let client = Client::new(&config).map_err(|e| anyhow!("Failed to create client: {}", e))?;
-        let mut pinger = client.pinger(target, PingIdentifier(random())).await;
-        pinger.timeout(timeout);
-
-        // Send ping
-        let seq = PingSequence(0);
-        match pinger.ping(seq, payload).await {
-            Ok((response_packet, rtt)) => {
-                let responder_ip = match response_packet {
-                    surge_ping::IcmpPacket::V4(pkt) => IpAddr::V4(pkt.get_source()),
-                    surge_ping::IcmpPacket::V6(pkt) => IpAddr::V6(pkt.get_source()),
-                };
-                let rtt_ms = rtt.as_secs_f64() * 1000.0;
-                Ok((responder_ip, rtt_ms))
-            }
-            Err(e) => Err(anyhow!("Ping failed: {}", e)),
         }
     }
 
