@@ -3,7 +3,7 @@ use libc::{
     c_void, sockaddr, sockaddr_in, sock_extended_err, socklen_t,
     msghdr, iovec, CMSG_FIRSTHDR, CMSG_DATA, IPPROTO_IP, IP_RECVERR, IP_TTL,
     SOCK_DGRAM, AF_INET, MSG_ERRQUEUE, MSG_DONTWAIT, AF_INET as PF_INET,
-    EHOSTUNREACH, EPROTO,
+    EHOSTUNREACH, ECONNREFUSED,
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
@@ -176,7 +176,7 @@ fn read_error_queue(fd: i32) -> Result<Option<(IpAddr, IcmpResponseType, f64)>> 
             // The offending address follows the sock_extended_err struct
 
             let is_time_exceeded = serr.ee_errno == EHOSTUNREACH as u32; // ICMP Time Exceeded maps to EHOSTUNREACH
-            let is_port_unreachable = serr.ee_errno == EPROTO as u32; // ICMP Port Unreachable maps to EPROTO
+            let is_port_unreachable = serr.ee_errno == ECONNREFUSED as u32; // ICMP Port Unreachable maps to ECONNREFUSED on Linux
 
             let response_type = if is_time_exceeded {
                 IcmpResponseType::TimeExceeded
@@ -324,6 +324,15 @@ pub async fn run_traceroute(target: IpAddr) -> Result<Vec<HopData>> {
         }
 
         hops.push(hop);
+
+        // Early termination: if last 3 hops all timed out, stop
+        if hops.len() >= 3 {
+            let last_3: Vec<&HopData> = hops.iter().rev().take(3).collect();
+            if last_3.iter().all(|h| h.rtts.is_empty()) {
+                println!("⚠️  3 consecutive timeouts — stopping early");
+                break;
+            }
+        }
 
         if target_reached {
             println!("✅ Target reached at hop {}", ttl);
