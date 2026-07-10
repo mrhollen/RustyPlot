@@ -1,0 +1,45 @@
+[package]
+name = "rustyplot"
+version = "0.1.0"
+edition = "2021"
+description = "A TCP-based graphical traceroute tool for diagnosing network connections"
+
+[dependencies]
+# Core error handling
+anyhow = "1.0"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Network - surge-ping for TCP traceroute/ping
+surge-ping = "0.8"
+
+# Raw socket creation for ICMP traceroute
+socket2 = { version = "0.5", features = ["all"] }
+
+# UI - eframe (egui + windowing)
+eframe = "0.29"
+egui = "0.29"
+egui_plot = "0.29"
+
+# CLI - argument parsing
+clap = { version = "4", features = ["derive"], optional = true }
+
+# Utilities
+chrono = "0.4"
+hostname = "0.4"
+log = "0.4"
+env_logger = "0.11"
+rand = "0.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[[bin]]
+name = "rustyplot-cli"
+path = "src/bin/rustyplot-cli.rs"
+required-features = ["cli"]
+
+[features]
+cli = ["dep:clap"]
