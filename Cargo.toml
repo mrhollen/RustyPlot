@@ -14,8 +14,8 @@ tokio = { version = "1", features = ["full"] }
 # Network - surge-ping for TCP traceroute/ping
 surge-ping = "0.8"
 
-# Raw socket creation for ICMP traceroute
-socket2 = { version = "0.5", features = ["all"] }
+# libc FFI for UDP traceroute with IP_RECVERR
+libc = "0.2"
 
 # UI - eframe (egui + windowing)
 eframe = "0.29"

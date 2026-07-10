@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
-use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use libc::{
+    c_void, sockaddr, sockaddr_in, sock_extended_err, socklen_t,
+    msghdr, iovec, CMSG_FIRSTHDR, CMSG_DATA, IPPROTO_IP, IP_RECVERR, IP_TTL,
+    SOCK_DGRAM, AF_INET, MSG_ERRQUEUE, MSG_DONTWAIT, AF_INET as PF_INET,
+    EHOSTUNREACH, EPROTO,
+};
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
-use tokio::net::UdpSocket;
-use rand::Rng;
 
 /// Maximum number of hops to trace
 const MAX_HOPS: u8 = 30;
@@ -14,278 +17,277 @@ const ATTEMPTS_PER_HOP: u32 = 3;
 /// Timeout for each probe attempt
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Size of the ICMP payload (data after ICMP header)
-const ICMP_PAYLOAD_SIZE: usize = 32;
+/// Base port for UDP traceroute probes (standard: 33434)
+const BASE_PORT: u16 = 33434;
 
-/// Total size of our ICMP Echo Request packet
-const ICMP_PACKET_SIZE: usize = 8 + ICMP_PAYLOAD_SIZE; // 8-byte header + payload
+/// Size of the UDP probe payload
+const PROBE_SIZE: usize = 40;
 
-/// Types of ICMP responses we care about in traceroute
+// ─── Response Types ─────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum IcmpResponseType {
     /// ICMP Time Exceeded (Type 11) — intermediate router responded
     TimeExceeded,
-    /// ICMP Echo Reply (Type 0) — target reached
-    EchoReply,
+    /// ICMP Port Unreachable (Type 3, Code 3) — target reached
+    PortUnreachable,
 }
 
-// ─── ICMP Packet Building ───────────────────────────────────────────────
+// ─── Hop Data ────────────────────────────────────────────────────────────
 
-/// Build an ICMP Echo Request packet.
-/// 
-/// Format (IPv4):
-/// [Type:1][Code:1][Checksum:2][Id:2][Seq:2][Data:32]
-/// Total: 40 bytes
-pub fn build_icmp_echo_request(ident: u16, seq: u16) -> Vec<u8> {
-    let mut packet = vec![0u8; ICMP_PACKET_SIZE];
-    
-    // Type = 8 (Echo Request)
-    packet[0] = 8;
-    // Code = 0
-    packet[1] = 0;
-    // Checksum = 0 (filled in later)
-    // bytes 2-3: checksum (will be calculated)
-    // Identifier
-    packet[4] = ((ident >> 8) & 0xFF) as u8;
-    packet[5] = (ident & 0xFF) as u8;
-    // Sequence number
-    packet[6] = ((seq >> 8) & 0xFF) as u8;
-    packet[7] = (seq & 0xFF) as u8;
-    
-    // Fill payload with predictable data (timestamp + pattern)
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let ts = timestamp.as_nanos() as u64;
-    for i in 0..ICMP_PAYLOAD_SIZE {
-        packet[8 + i] = ((ts >> (i * 8)) & 0xFF) as u8;
-    }
-    
-    // Calculate and set checksum
-    let checksum = calculate_checksum(&packet);
-    packet[2] = ((checksum >> 8) & 0xFF) as u8;
-    packet[3] = (checksum & 0xFF) as u8;
-    
-    packet
+#[derive(Debug, Clone)]
+pub struct HopData {
+    pub hop_number: u8,
+    pub ip: IpAddr,
+    pub rtts: Vec<f64>,
+    pub packets_sent: u32,
+    pub packets_received: u32,
 }
 
-/// Calculate ICMP checksum (one's complement of one's complement sum)
-fn calculate_checksum(packet: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    let mut i = 0;
-    
-    // Sum all 16-bit words
-    while i + 1 < packet.len() {
-        let word = (packet[i] as u32) << 8 | (packet[i + 1] as u32);
-        sum += word;
-        i += 2;
+// ─── Socket Creation ────────────────────────────────────────────────────
+
+/// Create a UDP socket with IP_RECVERR enabled.
+/// Returns the raw file descriptor.
+fn create_traceroute_socket() -> Result<i32> {
+    let fd = unsafe {
+        libc::socket(PF_INET, SOCK_DGRAM, 0)
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("Failed to create UDP socket")?;
     }
-    
-    // Handle odd-length packet (shouldn't happen for us, but be safe)
-    if i < packet.len() {
-        sum += (packet[i] as u32) << 8;
+
+    // Enable IP_RECVERR — allows reading ICMP errors from the error queue
+    let enable: i32 = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            IPPROTO_IP,
+            IP_RECVERR,
+            &enable as *const _ as *const c_void,
+            std::mem::size_of::<i32>() as socklen_t,
+        )
+    };
+    if ret < 0 {
+        unsafe { libc::close(fd) };
+        return Err(std::io::Error::last_os_error())
+            .context("Failed to set IP_RECVERR")?;
     }
-    
-    // Fold carries
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    
-    // One's complement
-    !sum as u16 & 0xFFFF
+
+    Ok(fd)
 }
 
-// ─── ICMP Response Parsing ──────────────────────────────────────────────
-
-/// Parse an ICMP response packet and determine its type.
-///
-/// For traceroute, we care about two types:
-/// - **ICMP Time Exceeded (Type 11)**: An intermediate router dropped our packet
-/// - **ICMP Echo Reply (Type 0)**: The target responded directly
-///
-/// The response packet contains the original Echo Request embedded inside it,
-/// which we can use to verify it matches our probe (by checking ident + seq).
-fn parse_icmp_response(buffer: &[u8]) -> Option<(IcmpResponseType, u16, u16)> {
-    if buffer.len() < 8 {
-        return None;
+/// Set the TTL on the socket.
+fn set_ttl(fd: i32, ttl: i32) -> Result<()> {
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            IPPROTO_IP,
+            IP_TTL,
+            &ttl as *const _ as *const c_void,
+            std::mem::size_of::<i32>() as socklen_t,
+        )
+    };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+            .context(format!("Failed to set TTL to {}", ttl))
+    } else {
+        Ok(())
     }
+}
 
-    let icmp_type = buffer[0];
-    let _icmp_code = buffer[1];
+// ─── Sending Probes ─────────────────────────────────────────────────────
 
-    // Determine response type
-    let response_type = match (icmp_type, _icmp_code) {
-        (11, 0) => IcmpResponseType::TimeExceeded, // Time Exceeded, TTL=0
-        (0, 0)  => IcmpResponseType::EchoReply,    // Echo Reply
-        _ => return None, // Ignore other ICMP types
+/// Send a UDP probe to the target with the given TTL.
+fn send_probe(fd: i32, target: Ipv4Addr, port: u16, payload: &[u8]) -> Result<()> {
+    let mut dest = sockaddr_in {
+        sin_family: AF_INET as u16,
+        sin_port: port,
+        sin_addr: libc::in_addr { s_addr: target.into() },
+        sin_zero: [0; 8],
+    };
+    unsafe { std::ptr::write_bytes(dest.sin_zero.as_mut_ptr(), 0, 8) };
+
+    let ret = unsafe {
+        libc::sendto(
+            fd,
+            payload.as_ptr() as *const c_void,
+            payload.len(),
+            0,
+            &dest as *const _ as *const sockaddr,
+            std::mem::size_of::<sockaddr_in>() as socklen_t,
+        )
+    };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+            .context("Failed to send UDP probe")
+    } else {
+        Ok(())
+    }
+}
+
+// ─── Reading from Error Queue ───────────────────────────────────────────
+
+/// Read an ICMP error from the socket's error queue using recvmsg.
+/// Returns (responder_ip, response_type, rtt_ms) or None if no error available.
+fn read_error_queue(fd: i32) -> Result<Option<(IpAddr, IcmpResponseType, f64)>> {
+    let mut iov = iovec {
+        iov_base: std::ptr::null_mut() as *mut c_void,
+        iov_len: 0,
     };
 
-    // Extract the embedded original packet to verify it matches our probe
-    // For Time Exceeded: original IP header starts at offset 8 (after ICMP error header)
-    // The ICMP error message contains:
-    //   [8 bytes ICMP error header][original IP header + original packet data]
-    // The original IPv4 header is typically 20 bytes (IHL=5), so original ICMP starts at offset 28
-    // But we need to read the IHL from the original IP header at offset 8
+    // Control message buffer (needs to be large enough for IP_RECVERR)
+    let mut control_buf = [0u8; 256];
 
-    let original_ip_offset = 8; // Start of embedded original IP header
-    if buffer.len() < original_ip_offset + 20 {
-        return None;
+    let mut msg = msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: control_buf.as_mut_ptr() as *mut c_void,
+        msg_controllen: control_buf.len(),
+        msg_flags: 0,
+    };
+
+    let ret = unsafe {
+        libc::recvmsg(fd, &mut msg, MSG_ERRQUEUE | MSG_DONTWAIT)
+    };
+
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EAGAIN) => return Ok(None), // EWOULDBLOCK == EAGAIN on Linux
+            _ => return Err(err).context("recvmsg failed"),
+        }
     }
 
-    // Get original IP header length
-    let ihl = (buffer[original_ip_offset] & 0x0F) as usize * 4;
-    let original_icmp_offset = original_ip_offset + ihl;
+    // Parse control messages to find IP_RECVERR
+    let mut cmsg = unsafe { CMSG_FIRSTHDR(&msg) };
+    while !cmsg.is_null() {
+        let cmsg_data = unsafe { &*cmsg };
 
-    if buffer.len() < original_icmp_offset + 4 {
-        return None;
+        if cmsg_data.cmsg_level == IPPROTO_IP && cmsg_data.cmsg_type == IP_RECVERR {
+            // Parse the sock_extended_err structure
+            let serr = unsafe { &*(CMSG_DATA(cmsg) as *const sock_extended_err) };
+
+            // Determine response type:
+            // EE_ORIGIN_ICMP — ICMP error (Time Exceeded or Port Unreachable)
+            // serr->ee_info contains the original destination address
+            // The offending address follows the sock_extended_err struct
+
+            let is_time_exceeded = serr.ee_errno == EHOSTUNREACH as u32; // ICMP Time Exceeded maps to EHOSTUNREACH
+            let is_port_unreachable = serr.ee_errno == EPROTO as u32; // ICMP Port Unreachable maps to EPROTO
+
+            let response_type = if is_time_exceeded {
+                IcmpResponseType::TimeExceeded
+            } else if is_port_unreachable {
+                IcmpResponseType::PortUnreachable
+            } else {
+                // Not a response we care about, continue to next cmsg
+                unsafe {
+                    cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+                }
+                continue;
+            };
+
+            // Extract the offending address (the router that sent the ICMP error)
+            // It follows the sock_extended_err structure
+            let addr_ptr = unsafe {
+                ((serr as *const sock_extended_err as *const u8)
+                    .add(std::mem::size_of::<sock_extended_err>()))
+                    as *const sockaddr_in
+            };
+
+            let addr = unsafe { *addr_ptr };
+            let responder_ip = IpAddr::V4(Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)));
+
+            // RTT is calculated by the caller using Instant::elapsed()
+            let rtt_ms = 0.0;
+
+            return Ok(Some((responder_ip, response_type, rtt_ms)));
+        }
+
+        unsafe {
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
     }
 
-    // Extract ident and seq from the original ICMP Echo Request
-    let ident = (buffer[original_icmp_offset + 4] as u16) << 8 | (buffer[original_icmp_offset + 5] as u16);
-    let seq = (buffer[original_icmp_offset + 6] as u16) << 8 | (buffer[original_icmp_offset + 7] as u16);
-
-    Some((response_type, ident, seq))
+    Ok(None)
 }
 
-// ─── Raw Socket Creation ────────────────────────────────────────────────
+// ─── Main Traceroute Logic ──────────────────────────────────────────────
 
-/// Create a raw ICMP socket and set the TTL.
-/// 
-/// Returns a tokio UdpSocket that can be used for async send/recv.
-async fn create_icmp_socket(ttl: u32) -> Result<UdpSocket> {
-    // Create a raw ICMP socket
-    let sock = Socket::new(
-        Domain::IPV4,
-        Type::RAW,
-        Some(Protocol::ICMPV4),
-    )
-    .context("Failed to create raw ICMP socket. Try running with sudo or check CAP_NET_RAW?")?;
-
-    // Bind to any local address (required for recv_from on raw sockets)
-    let local_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-    sock.bind(&local_addr.into())
-        .context("Failed to bind socket")?;
-
-    // Set TTL (Time To Live) - this controls how many hops the packet can traverse
-    sock.set_ttl(ttl)
-        .context("Failed to set socket TTL")?;
-
-    // Set receive timeout so we don't block forever
-    sock.set_read_timeout(Some(PROBE_TIMEOUT))
-        .context("Failed to set socket read timeout")?;
-    
-    // Convert to tokio UdpSocket for async operations
-    // This works because raw ICMP sockets behave like UDP sockets at the OS level
-    let std_socket: std::net::UdpSocket = sock.into();
-    let tokio_socket = UdpSocket::from_std(std_socket)?;
-    
-    Ok(tokio_socket)
-}
-
-// ─── Probe Sending ──────────────────────────────────────────────────────
-
-/// Send an ICMP Echo Request to the target and wait for a response.
-///
-/// Returns the responder IP address, response type, and RTT in milliseconds,
-/// or None on timeout.
-async fn send_probe(socket: &UdpSocket, target: IpAddr, ident: u16, seq: u16) -> Result<Option<(IpAddr, IcmpResponseType, f64)>> {
-    let packet = build_icmp_echo_request(ident, seq);
-    let start = std::time::Instant::now();
-
-    // Build target address for send_to
-    let target_addr = match target {
-        IpAddr::V4(addr) => SocketAddr::V4(SocketAddrV4::new(addr, 0)),
+/// Run a traceroute to the target IP address.
+pub async fn run_traceroute(target: IpAddr) -> Result<Vec<HopData>> {
+    let target_ip = match target {
+        IpAddr::V4(ip) => ip,
         IpAddr::V6(_) => {
             return Err(anyhow::anyhow!("IPv6 not yet supported"));
         }
     };
 
-    // Send the probe to the target
-    socket.send_to(&packet, target_addr).await
-        .context("Failed to send ICMP probe")?;
-
-    // Wait for response using recv_from to get the responder's IP
-    let mut buffer = vec![0u8; 1500];
-
-    match tokio::time::timeout(PROBE_TIMEOUT, socket.recv_from(&mut buffer)).await {
-        Ok(Ok((received_len, from_addr))) => {
-            let rtt = start.elapsed().as_secs_f64() * 1000.0; // Convert to milliseconds
-
-            // Parse the ICMP response
-            let response = parse_icmp_response(&buffer[..received_len]);
-
-            match response {
-                Some((response_type, resp_ident, resp_seq)) => {
-                    // Verify this response matches our probe
-                    if resp_ident == ident && resp_seq == seq {
-                        let responder_ip = from_addr.ip();
-                        Ok(Some((responder_ip, response_type, rtt)))
-                    } else {
-                        // Response doesn't match our probe, ignore it
-                        Ok(None)
-                    }
-                }
-                None => {
-                    // Unrecognized ICMP type, ignore
-                    Ok(None)
-                }
-            }
-        }
-        Ok(Err(e)) => {
-            // Log the error but don't fail the probe
-            eprintln!("Recv error: {}", e);
-            Ok(None)
-        }
-        Err(_timeout) => {
-            // Timed out - no response from this hop
-            Ok(None)
-        }
-    }
-}
-
-// ─── Public API ─────────────────────────────────────────────────────────
-
-/// Run a traceroute to the target IP address.
-///
-/// Returns a vector of hops, where each hop contains the responding IP,
-/// RTT measurements, and packet loss statistics.
-pub async fn run_traceroute(target: IpAddr) -> Result<Vec<HopData>> {
-    let ident: u16 = rand::thread_rng().gen();
     let mut hops: Vec<HopData> = Vec::new();
 
     println!("🔍 Starting traceroute to {}...", target);
+
+    let fd = create_traceroute_socket()?;
 
     for ttl in 1..=MAX_HOPS {
         let mut hop_rtts: Vec<f64> = Vec::new();
         let mut responder_ip: Option<IpAddr> = None;
         let mut target_reached = false;
 
-        // Create a new socket for this TTL value (already bound in create_icmp_socket)
-        let socket = create_icmp_socket(ttl as u32).await?;
+        // Set TTL for this hop
+        set_ttl(fd, ttl as i32)?;
 
-        // Send ATTEMPTS_PER_HOP probes with this TTL
+        // Calculate the destination port (standard traceroute uses BASE_PORT + TTL)
+        let port = BASE_PORT + ttl as u16;
+
+        // Create a simple payload
+        let payload = [ttl as u8; PROBE_SIZE];
+
+        // Send probes and read responses
         for attempt in 1..=ATTEMPTS_PER_HOP {
-            let seq = (ttl as u16) << 8 | (attempt as u16); // Encode TTL and attempt in sequence number
+            let start = std::time::Instant::now();
 
-            match send_probe(&socket, target, ident, seq).await {
-                Ok(Some((responder, response_type, rtt))) => {
-                    hop_rtts.push(rtt);
-                    responder_ip = Some(responder);
+            // Send the probe
+            if let Err(e) = send_probe(fd, target_ip, port, &payload) {
+                eprintln!("Send error at hop {}, attempt {}: {}", ttl, attempt, e);
+                continue;
+            }
 
-                    // Check if we've reached the target
-                    if response_type == IcmpResponseType::EchoReply {
-                        target_reached = true;
+            // Wait for response with timeout
+            let timeout = PROBE_TIMEOUT;
+            let _deadline = start + timeout;
+
+            loop {
+                if start.elapsed() >= timeout {
+                    break; // Timeout
+                }
+
+                match read_error_queue(fd)? {
+                    Some((ip, response_type, _rtt)) => {
+                        let rtt = start.elapsed().as_secs_f64() * 1000.0;
+                        hop_rtts.push(rtt);
+                        responder_ip = Some(ip);
+
+                        if response_type == IcmpResponseType::PortUnreachable {
+                            target_reached = true;
+                        }
+                        break;
                     }
-                }
-                Ok(None) => {
-                    // Timeout on this attempt
-                }
-                Err(e) => {
-                    eprintln!("Probe error at hop {}, attempt {}: {}", ttl, attempt, e);
+                    None => {
+                        // No error yet, wait a bit
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
                 }
             }
 
-            // Small delay between attempts to avoid overwhelming the network
+            if target_reached {
+                break;
+            }
+
+            // Small delay between attempts
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
@@ -299,10 +301,9 @@ pub async fn run_traceroute(target: IpAddr) -> Result<Vec<HopData>> {
                 packets_received: hop_rtts.len() as u32,
             }
         } else {
-            // All attempts timed out — record as a timeout hop
             HopData {
                 hop_number: ttl,
-                ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED), // 0.0.0.0 for timeouts
+                ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                 rtts: Vec::new(),
                 packets_sent: ATTEMPTS_PER_HOP,
                 packets_received: 0,
@@ -324,23 +325,15 @@ pub async fn run_traceroute(target: IpAddr) -> Result<Vec<HopData>> {
 
         hops.push(hop);
 
-        // If we reached the target, stop
         if target_reached {
             println!("✅ Target reached at hop {}", ttl);
             break;
         }
     }
 
+    // Close the socket
+    unsafe { libc::close(fd) };
+
     println!("Total hops discovered: {}", hops.len());
     Ok(hops)
-}
-
-/// Data collected for a single hop in the traceroute path.
-#[derive(Debug, Clone)]
-pub struct HopData {
-    pub hop_number: u8,
-    pub ip: IpAddr,
-    pub rtts: Vec<f64>,       // RTT measurements in milliseconds
-    pub packets_sent: u32,
-    pub packets_received: u32,
 }
