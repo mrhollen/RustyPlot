@@ -251,19 +251,88 @@ async fn send_probe(socket: &UdpSocket, target: IpAddr, ident: u16, seq: u16) ->
 /// RTT measurements, and packet loss statistics.
 pub async fn run_traceroute(target: IpAddr) -> Result<Vec<HopData>> {
     let ident: u16 = rand::thread_rng().gen();
+    let mut hops: Vec<HopData> = Vec::new();
 
-    // Create socket (binds internally via socket2)
-    let socket = create_icmp_socket(1).await?;
+    println!("🔍 Starting traceroute to {}...", target);
 
-    // Quick test: send one probe
-    let result = send_probe(&socket, target, ident, 0).await?;
-    if let Some((responder_ip, response_type, rtt)) = result {
-        println!("Test probe responded: {} (type: {:?}, RTT: {:.1}ms)", responder_ip, response_type, rtt);
-    } else {
-        println!("Test probe timed out");
+    for ttl in 1..=MAX_HOPS {
+        let mut hop_rtts: Vec<f64> = Vec::new();
+        let mut responder_ip: Option<IpAddr> = None;
+        let mut target_reached = false;
+
+        // Create a new socket for this TTL value (already bound in create_icmp_socket)
+        let socket = create_icmp_socket(ttl as u32).await?;
+
+        // Send ATTEMPTS_PER_HOP probes with this TTL
+        for attempt in 1..=ATTEMPTS_PER_HOP {
+            let seq = (ttl as u16) << 8 | (attempt as u16); // Encode TTL and attempt in sequence number
+
+            match send_probe(&socket, target, ident, seq).await {
+                Ok(Some((responder, response_type, rtt))) => {
+                    hop_rtts.push(rtt);
+                    responder_ip = Some(responder);
+
+                    // Check if we've reached the target
+                    if response_type == IcmpResponseType::EchoReply {
+                        target_reached = true;
+                    }
+                }
+                Ok(None) => {
+                    // Timeout on this attempt
+                }
+                Err(e) => {
+                    eprintln!("Probe error at hop {}, attempt {}: {}", ttl, attempt, e);
+                }
+            }
+
+            // Small delay between attempts to avoid overwhelming the network
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Build the hop data
+        let hop = if let Some(ip) = responder_ip {
+            HopData {
+                hop_number: ttl,
+                ip,
+                rtts: hop_rtts.clone(),
+                packets_sent: ATTEMPTS_PER_HOP,
+                packets_received: hop_rtts.len() as u32,
+            }
+        } else {
+            // All attempts timed out — record as a timeout hop
+            HopData {
+                hop_number: ttl,
+                ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED), // 0.0.0.0 for timeouts
+                rtts: Vec::new(),
+                packets_sent: ATTEMPTS_PER_HOP,
+                packets_received: 0,
+            }
+        };
+
+        // Print hop info
+        if hop.rtts.is_empty() {
+            println!("Hop {}: * (timeout)", ttl);
+        } else {
+            let avg_rtt: f64 = hop.rtts.iter().sum::<f64>() / hop.rtts.len() as f64;
+            println!(
+                "Hop {}: {} — {:.1}ms avg",
+                ttl,
+                hop.ip,
+                avg_rtt
+            );
+        }
+
+        hops.push(hop);
+
+        // If we reached the target, stop
+        if target_reached {
+            println!("✅ Target reached at hop {}", ttl);
+            break;
+        }
     }
 
-    Ok(Vec::new())
+    println!("Total hops discovered: {}", hops.len());
+    Ok(hops)
 }
 
 /// Data collected for a single hop in the traceroute path.
